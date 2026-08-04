@@ -2,7 +2,7 @@
 Status - Alpha
 
 ### Description:
-"AutoBuildInstall-FireStorm", A Windows-only build helper that downloads the chosen Firestorm viewer source, auto-detects your hardware, compiles optimized Release binary with VS2019, shows 15-step progress bars for every download, and—on success—drops the finished viewer straight into the folder from which you ran the script, ready to launch.
+"AutoBuildInstall-FireStorm", A Windows-only build-helper that lists recent downloads of Firestorm viewer source, auto-detects your hardware, compiles optimized Release binary with VS2019/VS2022, shows 15-step progress bars for every download, and—on success—drops the finished viewer straight into the folder from which you ran the script, ready to launch.
 
 ### Preview:
 - The Menu (outdated)...
