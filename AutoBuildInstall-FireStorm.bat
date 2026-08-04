@@ -1,122 +1,112 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM ==== Static Configuration ====
-set "TITLE=PhoenixFirestorm-DetectBuildInstall"
-title %TITLE%
+REM ===========================================================================
+REM  AutoBuildInstall-FireStorm - launcher
+REM
+REM  Deliberately minimal. Its only jobs are to find a usable Python 3 and
+REM  hand control to autobuild_firestorm.py.
+REM
+REM  Notes:
+REM   * Administrator is NOT required and NOT wanted. Running the build
+REM     elevated causes pip cache and file-ownership problems.
+REM   * PowerShell is not used anywhere. Firestorm's build system mis-detects
+REM     the Visual Studio toolchain when driven from PowerShell.
+REM ===========================================================================
 
-REM ==== DP0 TO SCRIPT BLOCK ====
-set "ScriptDirectory=%~dp0"
-set "ScriptDirectory=%ScriptDirectory:~0,-1%"
-cd /d "%ScriptDirectory%"
-echo Dp0'd to Script.
+title AutoBuildInstall-FireStorm
 
-REM ==== Admin Check ====
-net session >nul 2>&1
-if %errorLevel% NEQ 0 (
-    echo Error: Admin Required!
-    echo Launching PowerShell Script in 5 seconds...
-    for /L %%i in (4,-1,1) do (
-        timeout /t 1 /nobreak >nul
-        <nul set /p "=Launching PowerShell Script in %%i seconds...   " >con
-    )
-    echo.
-    timeout /t 2 >nul
-    echo Right Click, Run As Administrator.
-    timeout /t 2 >nul
-    goto :end_of_script
-)
-echo Status: Administrator
-timeout /t 1 >nul
+set "SCRIPT_DIR=%~dp0"
+set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+cd /d "%SCRIPT_DIR%" || (echo Could not change to script directory. & goto :fatal)
 
-REM ==== Clear screen for clean display ====
-cls
+set "EXITCODE=1"
+set "PY_EXE="
 
-REM ==== Display header ====
+echo.
 echo ===============================================================================
 echo     AutoBuildInstall-FireStorm
 echo ===============================================================================
 echo.
 
-REM ==== Detect PowerShell Versions ====
-echo Detecting PowerShell versions...
-set "PWSH_FOUND=0"
-set "PS_FOUND=0"
-set "PWSH_VERSION="
-set "PS_VERSION="
-
-REM Check for PowerShell Core 7+ pwsh
-pwsh.exe -Command "$PSVersionTable.PSVersion.ToString()" >nul 2>&1
+REM ---- Warn if elevated -----------------------------------------------------
+net session >nul 2>&1
 if %errorLevel% EQU 0 (
-    set "PWSH_FOUND=1"
-    for /f "delims=" %%i in ('pwsh.exe -Command "$PSVersionTable.PSVersion.ToString()"') do set "PWSH_VERSION=%%i"
-    echo Detected: PowerShell Core/7+ v!PWSH_VERSION!
-) else (
-    echo [NOT FOUND] PowerShell Core/7+ ^(pwsh^)
-)
-
-REM Check for Windows PowerShell 5.1 powershell
-powershell.exe -Command "$PSVersionTable.PSVersion.ToString()" >nul 2>&1
-if %errorLevel% EQU 0 (
-    set "PS_FOUND=1"
-    for /f "delims=" %%i in ('powershell.exe -Command "$PSVersionTable.PSVersion.ToString()"') do set "PS_VERSION=%%i"
-    echo Detected: Windows PowerShell v!PS_VERSION!
-) else (
-    echo [NOT FOUND] Windows PowerShell ^(powershell^)
-)
-
-REM ==== Determine which PowerShell to use ====
-if !PWSH_FOUND! EQU 1 (
-    echo Priority: Using PowerShell Core/7+ v!PWSH_VERSION!
-    set "PS_EXECUTABLE=pwsh.exe"
-    set "PS_VERSION_ARG=7"
-) else if !PS_FOUND! EQU 1 (
-    echo Fallback: Using Windows PowerShell ^(powershell^) - v!PS_VERSION!
-    set "PS_EXECUTABLE=powershell.exe"
-    set "PS_VERSION_ARG=5"
-) else (
+    echo [WARN] Running as Administrator is not recommended for building.
+    echo        Close this and run normally if you hit permission errors.
     echo.
-    echo ERROR: No PowerShell installation detected!
-    echo Please install one of the following:
-    echo   - PowerShell 7+ ^(Recommended^): https://github.com/PowerShell/PowerShell   
-    echo   - Windows PowerShell 5.1 ^(Built into Windows 10+^)
+)
+
+REM ---- Locate Python 3 ------------------------------------------------------
+echo Locating Python 3...
+
+REM Prefer the py launcher, which resolves the newest install correctly.
+py -3 --version >nul 2>&1
+if !errorLevel! EQU 0 (
+    for /f "delims=" %%v in ('py -3 --version 2^>^&1') do set "PY_VER=%%v"
+    set "PY_EXE=py"
+    set "PY_ARGS=-3"
+    echo   Found via py launcher: !PY_VER!
+    goto :got_python
+)
+
+python --version >nul 2>&1
+if !errorLevel! EQU 0 (
+    for /f "delims=" %%v in ('python --version 2^>^&1') do set "PY_VER=%%v"
+    REM The Windows Store stub prints nothing useful and exits 9009 on use.
+    echo !PY_VER! | findstr /i "Python 3" >nul
+    if !errorLevel! EQU 0 (
+        set "PY_EXE=python"
+        set "PY_ARGS="
+        echo   Found on PATH: !PY_VER!
+        goto :got_python
+    )
+)
+
+echo.
+echo ERROR: No Python 3 installation was found.
+echo.
+echo   Install Python 3 from https://www.python.org/downloads/windows
+echo     - Tick "Add Python to PATH" during installation
+echo     - Tick "pip" under Optional Features
+echo.
+echo   If you installed it from the Microsoft Store, open Settings,
+echo   search "Manage app execution aliases", and disable the
+echo   python.exe / python3.exe aliases.
+echo.
+goto :fatal
+
+:got_python
+if not exist "%SCRIPT_DIR%\autobuild_firestorm.py" (
     echo.
-    goto :end_of_script
+    echo ERROR: autobuild_firestorm.py is missing from:
+    echo   %SCRIPT_DIR%
+    echo Keep both files together in the same folder.
+    echo.
+    goto :fatal
 )
 
 echo.
-
-REM ==== Clean 5-second countdown ====
-echo Launching Powershell in 3 Seconds...
->nul timeout /t 3 /nobreak
-echo.
-echo.
-echo.
+echo Starting builder...
 echo.
 
-REM ==== Fixed: Use -File for both PowerShell versions with proper path handling ====
-"%PS_EXECUTABLE%" -ExecutionPolicy Bypass -NoProfile -File "%ScriptDirectory%\phoenix_firestorm_build.ps1" -PSVersion %PS_VERSION_ARG%
-set EXITCODE=%ERRORLEVEL%
+REM Pass through any arguments given to this batch file.
+%PY_EXE% %PY_ARGS% "%SCRIPT_DIR%\autobuild_firestorm.py" %*
+set "EXITCODE=!errorLevel!"
 
-REM ==== Display exit message ====
 echo.
-if %EXITCODE% NEQ 0 (
-    echo BUILD FAILED ^(Exit Code: %EXITCODE%^)
+if "!EXITCODE!"=="0" (
+    echo ===============================================================================
+    echo     BUILD COMPLETED SUCCESSFULLY
+    echo ===============================================================================
 ) else (
-    echo                          BUILD COMPLETED SUCCESSFULLY
+    echo ===============================================================================
+    echo     FINISHED WITH ERRORS ^(exit code !EXITCODE!^)
+    echo ===============================================================================
 )
 echo.
-echo ..PowerShell Script Exited.
-echo.
 
-REM BREAK FOR DEBUG
-PAUSE
-
-REM ==== Clean exit countdown ====
-echo Exiting Batch in 5 Seconds...
->nul timeout /t 5 /nobreak
-echo.
-
-:end_of_script
-REM ==== Exit with the same code as PowerShell script ====
+:fatal
+echo Press any key to close...
+pause >nul
 exit /b %EXITCODE%
