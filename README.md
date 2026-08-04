@@ -109,3 +109,13 @@ Starting builder...
   Continue? [Y/n]
 
 ```
+
+### Instruction
+- One would need to have installed all the requirements.
+
+
+### Development
+- Wait until internet sorts itself out, and test again, it may already work.
+
+
+
