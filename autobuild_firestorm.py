@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import collections
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -242,6 +243,23 @@ class Spinner:
         self.clear()
         marker, colour = ("[ OK ]", C.GREEN) if success else ("[FAIL]", C.RED)
         say(f"  {marker} {self.label} - {note} ({self._elapsed()})", colour)
+
+
+def confirm(prompt: str, default: bool = True) -> bool:
+    """
+    Strict yes/no. Anything unrecognised re-asks rather than being treated as
+    consent - a typo should not silently start an hour-long build.
+    """
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{prompt} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no", "q", "quit"):
+            return False
+        say("  Please answer y or n.", C.YELLOW)
 
 
 class BuildError(RuntimeError):
@@ -832,9 +850,14 @@ def discover_toolchain() -> tuple[Toolchain, list[str]]:
         tc.cmake_version = ver[0] if ver else ""
         ok(f"cmake        {tc.cmake_version}")
         m = re.search(r"(\d+)\.(\d+)", tc.cmake_version)
-        if m and (int(m.group(1)), int(m.group(2))) < (4, 1):
-            warn(f"CMake {m.group(1)}.{m.group(2)} is older than the 4.1.2 Firestorm documents.")
-            warn("Usually fine for 7.2.x, but upgrade first if configure fails.")
+        if m:
+            version = (int(m.group(1)), int(m.group(2)))
+            # indra/CMakeLists.txt declares cmake_minimum_required(3.16.0) and
+            # has explicit policy handling for 3.29 and 3.31, so anything from
+            # 3.16 up is genuinely supported.
+            if version < (3, 16):
+                fail(f"CMake {m.group(1)}.{m.group(2)} is too old (3.16 minimum)")
+                issues.append("Install CMake 3.16 or newer: https://cmake.org/download")
     else:
         fail("cmake not found")
         issues.append("Install CMake and tick 'Add to system PATH': https://cmake.org/download")
@@ -1179,7 +1202,7 @@ def choose_version(preselected: str | None, git: Path | None) -> str:
         known = {t.name for t in tags} | {b[0] for b in BRANCHES}
         if ref not in known:
             warn(f"'{ref}' is not a known Firestorm tag.")
-            if input("  Try it as a branch name anyway? [y/N] ").strip().lower() not in ("y", "yes"):
+            if not confirm("  Try it as a branch name anyway?", default=False):
                 continue
         return ref
 
@@ -1428,6 +1451,342 @@ def purge_bad_cache(lines: list[str], cache_dir: Path) -> list[Path]:
             except OSError as exc:
                 warn(f"Could not delete {candidate}: {exc}")
     return removed
+
+
+# --------------------------------------------------------------------------
+# Dependency pre-seeding
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Archive:
+    name: str
+    url: str
+    digest: str
+    algorithm: str
+
+    @property
+    def filename(self) -> str:
+        return self.url.rsplit("/", 1)[-1]
+
+
+def parse_llsd(path: Path):
+    """
+    Minimal LLSD-XML reader, enough for autobuild.xml.
+
+    autobuild.xml is plist-shaped but wrapped in <llsd>, so plistlib cannot
+    read it directly and pulling in the llsd package just to read one file
+    would be overkill.
+    """
+    import xml.etree.ElementTree as ET
+
+    def convert(el):
+        tag = el.tag
+        if tag == "llsd":
+            children = list(el)
+            return convert(children[0]) if children else None
+        if tag == "map":
+            out = {}
+            kids = list(el)
+            i = 0
+            while i < len(kids) - 1:
+                if kids[i].tag == "key":
+                    out[kids[i].text] = convert(kids[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            return out
+        if tag == "array":
+            return [convert(c) for c in el]
+        if tag in ("string", "uri"):
+            return el.text or ""
+        if tag == "integer":
+            return int(el.text or 0)
+        if tag == "real":
+            return float(el.text or 0)
+        if tag == "boolean":
+            return (el.text or "").strip().lower() in ("1", "true")
+        return el.text
+
+    return convert(ET.parse(path).getroot())
+
+
+def windows_archives(src_dir: Path) -> list[Archive]:
+    """Every prebuilt archive this platform needs, from autobuild.xml."""
+    manifest = src_dir / "autobuild.xml"
+    if not manifest.exists():
+        return []
+    try:
+        data = parse_llsd(manifest)
+    except Exception as exc:
+        warn(f"Could not parse autobuild.xml ({exc}); leaving downloads to autobuild")
+        return []
+
+    out: list[Archive] = []
+    for name, package in sorted((data or {}).get("installables", {}).items()):
+        if not isinstance(package, dict):
+            continue
+        platforms = package.get("platforms") or {}
+        entry = platforms.get("windows64") or platforms.get("common")
+        if not isinstance(entry, dict):
+            continue
+        archive = entry.get("archive") or {}
+        url = archive.get("url")
+        digest = archive.get("hash")
+        if url and digest:
+            out.append(Archive(name, url, digest.strip().lower(),
+                               (archive.get("hash_algorithm") or "sha1").lower()))
+    return out
+
+
+def file_digest(path: Path, algorithm: str) -> str | None:
+    try:
+        h = hashlib.new(algorithm)
+    except ValueError:
+        return None
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest().lower()
+
+
+# 4xx codes where retrying cannot possibly help.
+PERMANENT_HTTP = {400, 401, 403, 404, 410, 451}
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}GB"
+
+
+def _fetch_range(url: str, part: Path, offset: int, spinner: Spinner | None,
+                 label: str, read_timeout: int = 45) -> tuple[int, int]:
+    """
+    Fetch from `offset` onwards, appending to `part`.
+
+    Returns (total_size, bytes_on_disk). A server that ignores the Range
+    request answers 200 instead of 206, in which case we start over rather
+    than silently appending a second copy of the file to the first.
+    """
+    headers = {
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        # GitHub's API asset endpoint returns JSON metadata unless the client
+        # explicitly asks for the binary.
+        "Accept": "application/octet-stream" if "api.github.com" in url else "*/*",
+        "Accept-Encoding": "identity",
+    }
+    if offset > 0:
+        headers["Range"] = f"bytes={offset}-"
+
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=read_timeout) as response:
+        status = getattr(response, "status", response.getcode())
+
+        if offset > 0 and status == 200:
+            offset = 0  # Range ignored; truncate and restart the transfer.
+
+        mode = "ab" if offset > 0 else "wb"
+
+        content_range = response.headers.get("Content-Range")
+        if content_range and "/" in content_range:
+            tail = content_range.rsplit("/", 1)[-1].strip()
+            total = int(tail) if tail.isdigit() else 0
+        else:
+            length = response.headers.get("Content-Length")
+            total = (int(length) + offset) if (length and length.isdigit()) else 0
+
+        got = offset
+        started = time.time()
+        with part.open(mode) as fh:
+            while True:
+                chunk = response.read(512 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                got += len(chunk)
+                if spinner:
+                    elapsed = max(time.time() - started, 0.001)
+                    rate = (got - offset) / elapsed
+                    resumed = " resumed" if offset else ""
+                    if total:
+                        spinner.status(
+                            f"{label}{resumed} {got * 100 // total}% "
+                            f"({_human(got)}/{_human(total)}) {_human(rate)}/s")
+                    else:
+                        spinner.status(f"{label}{resumed} {_human(got)} {_human(rate)}/s")
+
+    return total, got
+
+
+def download_verified(archive: Archive, dest: Path, spinner: Spinner | None,
+                      logger: Logger, max_attempts: int = 20,
+                      max_restarts: int = 3) -> bool:
+    """
+    Download one archive, resuming after every interruption.
+
+    Large transfers from these hosts drop regularly on some connections. The
+    important property is that a dropped connection costs only the remaining
+    bytes, never the ones already on disk: progress is kept in a .part file
+    and continued with a Range request. An attempt that moved any data at all
+    does not count against the retry budget, so a slow or flaky link makes
+    steady forward progress instead of restarting forever.
+
+    The file is only renamed into the cache once its checksum matches, so a
+    corrupt transfer can never be mistaken for a valid dependency.
+    """
+    part = dest.with_suffix(dest.suffix + ".part")
+    restarts = 0
+    attempt = 0
+    stalled = 0
+
+    while attempt < max_attempts:
+        attempt += 1
+        before = part.stat().st_size if part.exists() else 0
+
+        try:
+            total, got = _fetch_range(archive.url, part, before, spinner, archive.name)
+
+        except urllib.error.HTTPError as exc:
+            if exc.code == 416:
+                # Already have at least the whole file; fall through to verify.
+                total, got = before, before
+            elif exc.code in PERMANENT_HTTP:
+                logger.write(f"\n[preseed] {archive.name}: HTTP {exc.code} {exc.reason} "
+                             f"for {archive.url} - not retryable\n")
+                return False
+            else:
+                logger.write(f"\n[preseed] {archive.name}: HTTP {exc.code} on attempt {attempt}\n")
+                stalled += 1
+                time.sleep(min(2 * stalled, 20))
+                continue
+
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+            after = part.stat().st_size if part.exists() else 0
+            progressed = after > before
+            logger.write(
+                f"\n[preseed] {archive.name}: attempt {attempt} interrupted after "
+                f"{after - before} new bytes ({after} total): {exc}\n")
+            if progressed:
+                # Forward progress was made - don't spend the retry budget.
+                attempt -= 1
+                stalled = 0
+            else:
+                stalled += 1
+            if spinner:
+                spinner.status(f"{archive.name} reconnecting ({_human(after)} kept)")
+            time.sleep(min(2 * max(stalled, 1), 20))
+            continue
+
+        on_disk = part.stat().st_size if part.exists() else 0
+        if total and on_disk < total:
+            # Server closed early. Resume from where we stopped.
+            logger.write(f"\n[preseed] {archive.name}: short read {on_disk}/{total}, resuming\n")
+            stalled = 0
+            attempt -= 1 if on_disk > before else 0
+            continue
+
+        actual = file_digest(part, archive.algorithm)
+        if actual == archive.digest:
+            part.replace(dest)
+            return True
+
+        restarts += 1
+        logger.write(
+            f"\n[preseed] {archive.name}: checksum mismatch after full transfer\n"
+            f"  expected {archive.digest}\n  actual   {actual}\n"
+            f"  size     {on_disk}\n  restart  {restarts}/{max_restarts}\n")
+        part.unlink(missing_ok=True)
+        if restarts > max_restarts:
+            return False
+        if spinner:
+            spinner.status(f"{archive.name} corrupt, restarting from scratch")
+        time.sleep(2)
+
+    return False
+
+
+def preseed_cache(src_dir: Path, cache_dir: Path, logger: Logger,
+                  passes: int = 3) -> None:
+    """
+    Fetch and verify every prebuilt dependency before configure runs.
+
+    Anything still missing after a pass is retried in the next one. Partial
+    downloads survive between passes, so each pass resumes rather than starts
+    over, and a package that failed early gets more chances once the rest of
+    the queue has drained.
+    """
+    archives = windows_archives(src_dir)
+    if not archives:
+        info("No dependency manifest found; autobuild will fetch its own downloads")
+        return
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    pending: list[Archive] = []
+    for archive in archives:
+        target = cache_dir / archive.filename
+        if target.exists():
+            if file_digest(target, archive.algorithm) == archive.digest:
+                continue
+            warn(f"Cached {archive.filename} is corrupt; it will be re-fetched")
+            target.unlink(missing_ok=True)
+        pending.append(archive)
+
+    cached = len(archives) - len(pending)
+    if not pending:
+        ok(f"All {len(archives)} dependencies already cached and verified")
+        return
+
+    say(f"  {len(archives)} dependencies required, {cached} already valid, "
+        f"{len(pending)} to fetch", C.CYAN)
+    info("Interrupted transfers resume automatically; it is safe to stop and re-run.")
+    say()
+
+    for attempt in range(1, passes + 1):
+        if attempt > 1:
+            say()
+            warn(f"{len(pending)} package(s) still incomplete - pass {attempt} of {passes}")
+            info("Partial downloads are kept, so these resume where they stopped")
+            say()
+            time.sleep(3)
+
+        failed: list[Archive] = []
+        for index, archive in enumerate(pending, start=1):
+            spinner = Spinner(f"[{index}/{len(pending)}] {archive.name}")
+            spinner.animate()
+            target = cache_dir / archive.filename
+            succeeded = download_verified(archive, target, spinner, logger)
+            spinner.done("verified" if succeeded else "incomplete", success=succeeded)
+            if not succeeded:
+                failed.append(archive)
+
+        pending = failed
+        if not pending:
+            break
+
+    if pending:
+        names = ", ".join(a.name for a in pending)
+        detail = []
+        for archive in pending:
+            part = cache_dir / (archive.filename + ".part")
+            if part.exists():
+                detail.append(f"    {archive.name}: {_human(part.stat().st_size)} downloaded so far")
+            else:
+                detail.append(f"    {archive.name}: nothing downloaded - check the URL is reachable")
+        raise BuildError(
+            f"Could not download {len(pending)} dependency archive(s) after {passes} passes:\n"
+            f"  {names}\n" + "\n".join(detail) + "\n"
+            "  Partial downloads have been kept, so re-running will resume them.\n"
+            f"  Details are in {logger.path}"
+        )
+
+    ok(f"All {len(archives)} dependencies cached and verified")
 
 
 def configure(autobuild: Path, src_dir: Path, env: dict, hw: Hardware,
@@ -1771,7 +2130,7 @@ def check_disk_space(build_root: Path, explicit_root: bool = False) -> None:
 
     say()
     warn(f"You have {free:.0f} GB. The build may still fail when linking.")
-    if input("  Continue anyway? [y/N] ").strip().lower() not in ("y", "yes"):
+    if not confirm("  Continue anyway?", default=False):
         raise SystemExit("Stopped so you can free up space.")
 
 
@@ -1844,6 +2203,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--channel", default="SelfBuild", help="Viewer channel name suffix")
     parser.add_argument("--no-package", action="store_true",
                         help="Skip --package (faster, but the result will not run)")
+    parser.add_argument("--no-preseed", action="store_true",
+                        help="Skip the verified dependency pre-download and let autobuild fetch them")
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete the downloaded dependency cache before configuring")
     parser.add_argument("--fresh", action="store_true",
@@ -1916,7 +2277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             say()
             say(f"  Ready to build {ref} into {build_root}", C.CYAN)
             say("  This will take a long time and use a lot of disk.", C.YELLOW)
-            if input("  Continue? [Y/n] ").strip().lower() in ("n", "no"):
+            if not confirm("  Continue?", default=True):
                 return 0
 
         if args.clear_cache:
@@ -1928,6 +2289,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ok("Dependency cache cleared")
 
         started = time.time()
+
+        if not args.no_preseed:
+            header("DEPENDENCIES")
+            preseed_cache(src_dir, Path(env["AUTOBUILD_INSTALLABLE_CACHE"]), logger)
+
         configure(autobuild, src_dir, env, hw, logger, args.channel, not args.no_package)
         build(autobuild, src_dir, env, hw, logger)
         out_root = args.output.resolve() if args.output else script_dir
