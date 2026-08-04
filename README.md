@@ -124,5 +124,5 @@ Starting builder...
 - One would need to have installed all the requirements. Currently its not worked yet for me. So there is no way its likely to work for you.
 
 ### Development
-- Wait until internet sorts itself out, and test/develop again, it makes debugging possibly incomplete installer script a little harder otherwise, and time.
+- Recently picked back up and given some Opus 5 attention, however due to repeat failing downloads and time of day, wait until internet sorts itself out, and test/develop again, it makes debugging possibly incomplete installer script a little harder otherwise, and time is ticking.
 
