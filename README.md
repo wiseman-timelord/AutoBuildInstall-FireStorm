@@ -8,6 +8,7 @@ Status - Alpha
 - The Current output...
 ```
 
+
 ===============================================================================
     AutoBuildInstall-FireStorm
 ===============================================================================
@@ -21,8 +22,8 @@ Starting builder...
   AutoBuildInstall-FireStorm  v2.0
   Builds the Firestorm viewer from source, optimised for this machine.
 ==============================================================================
-  [ OK ] Build root   E:\fsbuild  (91 GB free, same drive as this script)
-  [ OK ] Disk space   91 GB free on E:\
+  [ OK ] Build root   E:\fsbuild  (81 GB free, same drive as this script)
+  [ OK ] Disk space   81 GB free on E:\
 
 ==============================================================================
   HARDWARE
@@ -46,12 +47,8 @@ Starting builder...
 ==============================================================================
   [ OK ] git          git version 2.52.0.windows.1
   [ OK ] cmake        cmake version 3.31.6-msvc6
-  [WARN] CMake 3.31 is older than the 4.1.2 Firestorm documents.
-  [WARN] Usually fine for 7.2.x, but upgrade first if configure fails.
   [ OK ] Visual Studio 2022  C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
   [ OK ] cygwin       C:\Program_Files\cygwin64\bin
-  [WARN] Cygwin is missing the 'patch' package (Devel/patch).
-  [WARN] Re-run Cygwin's setup and add it, or some 3p packages will fail.
   [ OK ] NSIS         C:\Program_Files\NSIS\makensis.EXE
   [ OK ] python       3.12.4 (C:\Program Files\Python312\python.exe)
 
@@ -88,7 +85,7 @@ Starting builder...
   SOURCE
 ==============================================================================
   [ .. ] Firestorm source: existing checkout at Firestorm_Release_7.2.3.80036, updating
-  [ OK ] Fetching Firestorm source - ok (00:00)
+  [ OK ] Fetching Firestorm source - ok (00:01)
   [ OK ] Firestorm source up to date at Firestorm_Release_7.2.3.80036
   [ .. ] build variables: existing checkout at master, updating
   [ OK ] Fetching build variables - ok (00:00)
@@ -106,16 +103,26 @@ Starting builder...
 
   Ready to build Firestorm_Release_7.2.3.80036 into E:\fsbuild
   This will take a long time and use a lot of disk.
-  Continue? [Y/n]
+  Continue? [Y/n] y
+
+==============================================================================
+  DEPENDENCIES
+==============================================================================
+  56 dependencies required, 4 already valid, 52 to fetch
+  [ .. ] Interrupted transfers resume automatically; it is safe to stop and re-run.
+
+  [ OK ] [1/52] boost - verified (00:37)
+  [ OK ] [2/52] colladadom - verified (00:24)
+  / [3/52] dictionaries [00:33]  dictionaries 7% (512.0KB/6.9MB) 1.1MB/s
+
+
+(...)
 
 ```
 
 ### Instruction
-- One would need to have installed all the requirements.
-
+- One would need to have installed all the requirements. Currently its not worked yet for me. So there is no way its likely to work for you.
 
 ### Development
-- Wait until internet sorts itself out, and test again, it may already work.
-
-
+- Wait until internet sorts itself out, and test/develop again, it makes debugging possibly incomplete installer script a little harder otherwise, and time.
 
